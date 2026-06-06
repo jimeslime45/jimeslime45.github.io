@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <style>
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background-color: crimson; color: white;
+      font-family: -apple-system, sans-serif;
+      display: flex; justify-content: center; align-items: center;
+      overflow: hidden; box-sizing: border-box;
+    }
+    #btn {
+      padding: 20px 40px; background: white; color: crimson;
+      font-weight: bold; border-radius: 10px; cursor: pointer; font-size: 1.5em;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.3); text-transform: uppercase;
+    }
+    #txt {
+      display: none; font-size: 2.2em; padding: 30px; text-align: center; line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="btn">TAP TO DECRYPT</div>
+  <h1 id="txt">YOUR CUSTOM TEXT HERE</h1>
+
+  <script>
+    const btn = document.getElementById('btn');
+    const txt = document.getElementById('txt');
+    
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      
+      const docEl = document.documentElement;
+      if (docEl.requestFullscreen) {
+        docEl.requestFullscreen().catch(err => console.log(err));
+      } else if (docEl.webkitRequestFullscreen) { /* Safari / iOS fallback */
+        docEl.webkitRequestFullscreen();
+      }
+      
+      btn.style.display = 'none';
+      txt.style.display = 'block';
+    });
+  </script>
+</body>
+</html>
