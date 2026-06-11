@@ -1,0 +1,987 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Battle Demo with P2P Lobby</title>
+<style>
+  html,body { height:100%; margin:0; background:#111; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; }
+  /* Hidden fallback textarea for clipboard operations (not part of gameplay UI) */
+  #hiddenCopy { position: absolute; left:-9999px; top:-9999px; opacity:0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<textarea id="hiddenCopy" aria-hidden="true"></textarea>
+
+<script type="module">
+/*
+  3D Battle Demo with P2P Lobby (single-file)
+  - Three.js ES module from CDN
+  - All assets generated procedurally
+  - P2P signaling via encoded URL fragment (no external signaling server)
+  - Shareable 6-digit code + URL
+*/
+
+/* --- Imports --- */
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+
+/* --- Renderer / Scene / Camera --- */
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.shadowMap.enabled = true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(0, 6, 12);
+
+const clock = new THREE.Clock();
+
+/* DPR throttling for mobile */
+function updateDPR() {
+  const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1 : 1.5));
+}
+updateDPR();
+
+/* Resize */
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  updateDPR();
+});
+
+/* --- Lighting --- */
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 0.9);
+hemi.position.set(0, 50, 0);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(-10, 20, 10);
+dir.castShadow = true;
+scene.add(dir);
+
+/* --- Ground / Island --- */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(400, 400),
+  new THREE.MeshStandardMaterial({ color: 0x2b8a3e })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const island = new THREE.Mesh(
+  new THREE.CylinderGeometry(40, 60, 6, 64),
+  new THREE.MeshStandardMaterial({ color: 0x2f7a3a })
+);
+island.position.set(0, -3, 0);
+island.receiveShadow = true;
+scene.add(island);
+
+/* --- Helpers: 3D Panel Canvas Textures --- */
+function makePanelTexture(textLines = [], width = 512, height = 256, bg = '#222', fg = '#fff') {
+  const canvas = document.createElement('canvas');
+  canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = fg;
+  ctx.font = '26px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const lineH = 34;
+  const startY = height / 2 - (textLines.length - 1) * lineH / 2;
+  for (let i = 0; i < textLines.length; i++) {
+    ctx.fillText(textLines[i], width / 2, startY + i * lineH);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.encoding = THREE.sRGBEncoding;
+  return tex;
+}
+function makePanelMesh(textLines, w = 2.6, h = 1.2, bg='#222', fg='#fff') {
+  const tex = makePanelTexture(textLines, 512, 256, bg, fg);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: false });
+  const geo = new THREE.PlaneGeometry(w, h);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.userData._panelTexture = tex;
+  return mesh;
+}
+
+/* --- Avatar generator --- */
+function makeAvatarMesh(color = 0x6699ff) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.4, 0.5), new THREE.MeshStandardMaterial({ color }));
+  body.position.y = 1.0; group.add(body);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.35, 16, 12), new THREE.MeshStandardMaterial({ color: 0xffe0bd }));
+  head.position.y = 2.05; group.add(head);
+  const left = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.8, 0.2), new THREE.MeshStandardMaterial({ color }));
+  left.position.set(-0.65, 1.2, 0); left.rotation.z = 0.2; group.add(left);
+  const right = left.clone(); right.position.x = 0.65; right.rotation.z = -0.2; group.add(right);
+  return group;
+}
+
+/* --- Game State --- */
+const GameState = {
+  mode: 'lobby', // lobby, loading, bus, drop, match, victory
+  lobby: { slots: [null, null, null, null], localSlot: 0, lobbyId: null, isHost: false },
+  match: { players: {}, chests: [], bus: { pos: new THREE.Vector3(-120, 60, -80), dir: new THREE.Vector3(1,0,1).normalize(), speed: 40 } }
+};
+
+/* Fill lobby with local + bots */
+function initLobby() {
+  const names = ['You', 'Bot-A', 'Bot-B', 'Bot-C'];
+  for (let i = 0; i < 4; i++) {
+    const isBot = i !== 0;
+    GameState.lobby.slots[i] = {
+      id: 'p' + i,
+      name: names[i],
+      color: new THREE.Color().setHSL(Math.random(), 0.6, 0.5).getHex(),
+      ready: isBot ? Math.random() > 0.5 : false,
+      isBot
+    };
+  }
+}
+initLobby();
+
+/* --- Lobby 3D scene --- */
+const lobbyGroup = new THREE.Group();
+scene.add(lobbyGroup);
+
+const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x333333, metalness: 0.2, roughness: 0.6 });
+const pedestalGeo = new THREE.CylinderGeometry(1.2, 1.2, 0.6, 32);
+
+const pedestals = [];
+for (let i = 0; i < 4; i++) {
+  const p = new THREE.Mesh(pedestalGeo, pedestalMat);
+  const angle = (i / 4) * Math.PI * 2;
+  const radius = 6;
+  p.position.set(Math.cos(angle) * radius, 0.3, Math.sin(angle) * radius);
+  p.rotation.y = -angle + Math.PI / 2;
+  lobbyGroup.add(p);
+  pedestals.push(p);
+
+  const slot = GameState.lobby.slots[i];
+  const avatar = makeAvatarMesh(slot.color);
+  avatar.position.copy(p.position).add(new THREE.Vector3(0, 0.6, 0));
+  avatar.userData.slotIndex = i;
+  lobbyGroup.add(avatar);
+  p.userData.avatar = avatar;
+
+  const panel = makePanelMesh([slot.name, slot.ready ? 'READY' : 'NOT READY'], 1.6, 0.8, '#111', '#fff');
+  panel.position.copy(p.position).add(new THREE.Vector3(0, 2.2, 0));
+  panel.lookAt(camera.position);
+  panel.userData.slotIndex = i;
+  lobbyGroup.add(panel);
+  p.userData.panel = panel;
+}
+
+/* Central menu group */
+const menuGroup = new THREE.Group();
+menuGroup.position.set(0, 1.6, 4.5);
+lobbyGroup.add(menuGroup);
+
+const skinPanel = makePanelMesh(['Skin: Default', 'Tap to cycle'], 2.6, 1.0, '#0b3', '#012');
+skinPanel.position.set(-1.6, 0, 0);
+menuGroup.add(skinPanel);
+
+const invitePanel = makePanelMesh(['Create Lobby', 'Share 6-digit code'], 2.6, 1.0, '#08f', '#012');
+invitePanel.position.set(0, 0, 0);
+menuGroup.add(invitePanel);
+
+const readyPanel = makePanelMesh(['Ready: NOT READY', 'Press E to toggle'], 2.6, 1.0, '#f80', '#120');
+readyPanel.position.set(1.6, 0, 0);
+menuGroup.add(readyPanel);
+
+const startPanel = makePanelMesh(['Waiting for players...'], 4.0, 1.2, '#222', '#fff');
+startPanel.position.set(0, 3.2, 0);
+lobbyGroup.add(startPanel);
+
+/* --- Map objects --- */
+const chestGeo = new THREE.BoxGeometry(0.9, 0.6, 0.6);
+const chestMat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b });
+
+function spawnChests(count = 12) {
+  GameState.match.chests.forEach(c => scene.remove(c));
+  GameState.match.chests = [];
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r = 8 + Math.random() * 28;
+    const x = Math.cos(angle) * r;
+    const z = Math.sin(angle) * r;
+    const m = new THREE.Mesh(chestGeo, chestMat);
+    m.position.set(x, 0.5, z);
+    m.userData.id = 'chest' + i;
+    m.userData.opened = false;
+    scene.add(m);
+    GameState.match.chests.push(m);
+  }
+}
+
+/* --- Match players --- */
+function createMatchPlayer(slot) {
+  const id = slot.id;
+  const mesh = makeAvatarMesh(slot.color);
+  mesh.position.set(0, 6, 0);
+  mesh.userData.id = id;
+  mesh.userData.health = 100;
+  mesh.userData.alive = true;
+  mesh.userData.isLocal = slot.name === 'You';
+  mesh.userData.isBot = slot.isBot;
+  scene.add(mesh);
+  GameState.match.players[id] = {
+    id, name: slot.name, mesh, color: slot.color, ready: slot.ready, isBot: slot.isBot,
+    hasGlider: false, onGround: false, velocity: new THREE.Vector3(), yaw: 0
+  };
+}
+
+/* --- Projectiles --- */
+const projectiles = [];
+const projGeo = new THREE.SphereGeometry(0.08, 8, 8);
+const projMat = new THREE.MeshStandardMaterial({ color: 0xffcc00, emissive: 0x442200 });
+function spawnProjectile(pos, dir, ownerId) {
+  const m = new THREE.Mesh(projGeo, projMat);
+  m.position.copy(pos);
+  m.userData.vel = dir.clone().multiplyScalar(30);
+  m.userData.owner = ownerId;
+  scene.add(m);
+  projectiles.push(m);
+}
+
+/* --- Input --- */
+const input = { forward:0, right:0, jump:false, fire:false, interact:false };
+const keys = {};
+window.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'KeyE') input.interact = true;
+  if (e.code === 'Space') input.jump = true;
+  if (e.code === 'KeyF') input.fire = true;
+});
+window.addEventListener('keyup', (e) => {
+  keys[e.code] = false;
+  if (e.code === 'KeyE') input.interact = false;
+  if (e.code === 'Space') input.jump = false;
+  if (e.code === 'KeyF') input.fire = false;
+});
+
+/* --- Raycasting for 3D UI interaction --- */
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+function setPointerFromEvent(e) {
+  const p = e.touches && e.touches[0] ? e.touches[0] : e;
+  pointer.x = (p.clientX / window.innerWidth) * 2 - 1;
+  pointer] = false;
+  if (e.code === 'KeyE') input.interact = false;
+  if (e.code === 'Space') input.jump = false;
+  if (e.code === 'KeyF') input.fire = false;
+});
+
+/* --- Raycasting for 3D UI interaction --- */
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+function setPointerFromEvent(e) {
+  const p = e.touches && e.touches[0] ? e.touches[0] : e;
+  pointer.x = (p.clientX / window.innerWidth) * 2 - 1;
+  pointer.y = -(p.clientY / window.innerHeight) * 2 + 1;
+}
+canvas.addEventListener('pointerdown', (e) => { setPointerFromEvent(e); onPointerDown(); });
+canvas.addEventListener('touchstart', (e) => { setPointerFromEvent(e); onPointerDown(); }, {passive:false});
+canvas.addEventListener('mousedown', (e) => { setPointerFromEvent(e); onPointerDown(); });
+
+function onPointerDown() {
+  raycaster.setFromCamera(pointer, camera);
+  const intersects = raycaster.intersectObjects(scene.children, true);
+  if (!intersects.length) return;
+  const hit = intersects[0].object;
+  if (hit.userData.slotIndex !== undefined) {
+    const idx = hit.userData.slotIndex;
+    if (idx === GameState.lobby.localSlot) {
+      const slot = GameState.lobby.slots[idx];
+      slot.color = new THREE.Color().setHSL(Math.random(), 0.6, 0.5).getHex();
+      pedestals[idx].userData.avatar.traverse(c => { if (c.isMesh) c.material.color.setHex(slot.color); });
+      updateSlotPanel(idx);
+      broadcastLobbyState();
+    }
+  }
+  if (hit === skinPanel) {
+    const slot = GameState.lobby.slots[GameState.lobby.localSlot];
+    slot.color = new THREE.Color().setHSL(Math.random(), 0.6, 0.5).getHex();
+    pedestals[0].userData.avatar.traverse(c => { if (c.isMesh) c.material.color.setHex(slot.color); });
+    updateSlotPanel(0);
+    broadcastLobbyState();
+  } else if (hit === invitePanel) {
+    // Create lobby (host) and generate 6-digit code + shareable URL
+    if (!GameState.lobby.lobbyId) {
+      createLocalLobbyAndShare();
+    } else {
+      showTempMessage('Lobby already created: ' + GameState.lobby.lobbyId);
+    }
+  } else if (hit === readyPanel) {
+    toggleReadyLocal();
+    broadcastLobbyState();
+  }
+}
+
+/* --- Clipboard helper --- */
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(()=>{});
+  } else {
+    const ta = document.getElementById('hiddenCopy');
+    ta.value = text; ta.select();
+    try { document.execCommand('copy'); } catch(e){}
+  }
+}
+
+/* --- Lobby UI updates --- */
+function updateSlotPanel(i) {
+  const slot = GameState.lobby.slots[i];
+  const panel = pedestals[i].userData.panel;
+  const tex = panel.userData._panelTexture;
+  const ctx = tex.image.getContext('2d');
+  ctx.fillStyle = '#111'; ctx.fillRect(0,0,tex.image.width, tex.image.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = '26px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(slot.name, tex.image.width/2, tex.image.height/2 - 18);
+  ctx.fillText(slot.ready ? 'READY' : 'NOT READY', tex.image.width/2, tex.image.height/2 + 18);
+  tex.needsUpdate = true;
+  pedestals[i].userData.avatar.traverse((c) => { if (c.isMesh) c.material.color.setHex(slot.color); });
+}
+
+function updateStartPanel() {
+  const allReady = GameState.lobby.slots.every(s => s && s.ready);
+  const tex = startPanel.userData._panelTexture;
+  const ctx = tex.image.getContext('2d');
+  ctx.fillStyle = '#222'; ctx.fillRect(0,0,tex.image.width, tex.image.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = '32px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(allReady ? 'All Ready — Starting...' : 'Waiting for players...', tex.image.width/2, tex.image.height/2);
+  tex.needsUpdate = true;
+}
+
+/* Toggle local ready */
+function toggleReadyLocal() {
+  const slot = GameState.lobby.slots[GameState.lobby.localSlot];
+  slot.ready = !slot.ready;
+  updateSlotPanel(GameState.lobby.localSlot);
+  updateStartPanel();
+  // bots randomize
+  for (let i = 1; i < 4; i++) {
+    if (Math.random() > 0.6) GameState.lobby.slots[i].ready = true;
+    updateSlotPanel(i);
+  }
+  updateStartPanel();
+  checkAllReadyAndStart();
+}
+
+/* Check all ready and start match */
+function checkAllReadyAndStart() {
+  const allReady = GameState.lobby.slots.every(s => s && s.ready);
+  if (allReady) {
+    setTimeout(() => startMatchFlow(), 900);
+  }
+}
+
+/* --- Match flow --- */
+function startMatchFlow() {
+  GameState.mode = 'loading';
+  GameState.match.players = {};
+  for (let i = 0; i < 4; i++) createMatchPlayer(GameState.lobby.slots[i]);
+  spawnChests(14);
+  showLoadingRing();
+  setTimeout(() => {
+    GameState.mode = 'bus';
+    hideLoadingRing();
+    camera.position.set(-40, 30, -40);
+    camera.lookAt(0, 0, 0);
+  }, 1600);
+}
+
+/* Loading ring */
+let loadingRing = null;
+function showLoadingRing() {
+  const geo = new THREE.RingGeometry(3.2, 3.6, 64);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  loadingRing = new THREE.Mesh(geo, mat);
+  loadingRing.rotation.x = -Math.PI/2;
+  loadingRing.position.set(0, 6, 0);
+  scene.add(loadingRing);
+}
+function hideLoadingRing() { if (loadingRing) scene.remove(loadingRing); loadingRing = null; }
+
+/* Bus */
+const bus = new THREE.Group();
+const busBody = new THREE.Mesh(new THREE.BoxGeometry(6, 2.2, 2.6), new THREE.MeshStandardMaterial({ color: 0xff3333 }));
+busBody.position.y = 0; bus.add(busBody);
+bus.position.copy(GameState.match.bus.pos);
+scene.add(bus);
+
+/* --- Physics & update loop --- */
+function update(delta) {
+  if (GameState.mode === 'lobby') {
+    lobbyGroup.rotation.y += delta * 0.12;
+    lobbyGroup.traverse((o) => {
+      if (o.userData && o.userData.slotIndex !== undefined && o.userData._panelTexture) o.lookAt(camera.position);
+    });
+  } else if (GameState.mode === 'bus') {
+    const b = GameState.match.bus;
+    const move = b.dir.clone().multiplyScalar(b.speed * delta);
+    b.pos.add(move);
+    bus.position.copy(b.pos);
+    bus.lookAt(b.pos.clone().add(b.dir));
+    for (const id in GameState.match.players) {
+      const p = GameState.match.players[id];
+      p.mesh.position.copy(bus.position).add(new THREE.Vector3(Math.random()*2-1, -1.2, Math.random()*2-1));
+    }
+    if (b.pos.x > 40 && GameState.mode !== 'drop') {
+      GameState.mode = 'drop';
+      for (const id in GameState.match.players) {
+        const p = GameState.match.players[id];
+        p.mesh.position.copy(bus.position).add(new THREE.Vector3((Math.random()-0.5)*6, -2.5, (Math.random()-0.5)*2));
+        p.velocity.set(0, -2 - Math.random()*2, 0);
+        p.hasGlider = false; p.onGround = false;
+      }
+      const local = GameState.match.players['p0'];
+      camera.position.copy(local.mesh.position).add(new THREE.Vector3(0, 6, 12));
+      camera.lookAt(local.mesh.position);
+    }
+  } else if (GameState.mode === 'drop' || GameState.mode === 'match') {
+    for (const id in GameState.match.players) {
+      const p = GameState.match.players[id];
+      if (!p.mesh.userData.alive) continue;
+      p.velocity.y -= 9.8 * delta * 0.6;
+      if (p.hasGlider) p.velocity.y = Math.max(p.velocity.y, -2.0);
+      p.mesh.position.addScaledVector(p.velocity, delta);
+      if (p.mesh.position.y <= 0.6) { p.mesh.position.y = 0.6; p.velocity.y = 0; p.onGround = true; }
+      if (p.isBot && p.onGround && Math.random() < 0.01) {
+        p.mesh.position.x += (Math.random()-0.5) * delta * 6;
+        p.mesh.position.z += (Math.random()-0.5) * delta * 6;
+        if (Math.random() < 0.02) {
+          const target = findNearestAliveExcept(p.id);
+          if (target) {
+            const dir = target.mesh.position.clone().sub(p.mesh.position).normalize();
+            spawnProjectile(p.mesh.position.clone().add(new THREE.Vector3(0,1.2,0)), dir, p.id);
+          }
+        }
+      }
+    }
+
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const pr = projectiles[i];
+      pr.position.addScaledVector(pr.userData.vel, delta);
+      if (pr.position.length() > 500) { scene.remove(pr); projectiles.splice(i,1); continue; }
+      for (const id in GameState.match.players) {
+        const p = GameState.match.players[id];
+        if (!p.mesh.userData.alive) continue;
+        if (p.mesh.position.distanceTo(pr.position) < 0.8 && pr.userData.owner !== id) {
+          p.mesh.userData.health -= 25;
+          scene.remove(pr); projectiles.splice] = false;
+  if (e.code === 'KeyE') input.interact = false;
+  if (e.code === 'Space') input.jump = false;
+  if (e.code === 'KeyF') input.fire = false;
+});
+
+/* --- Raycasting for 3D UI interaction --- */
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+function setPointerFromEvent(e) {
+  const p = e.touches && e.touches[0] ? e.touches[0] : e;
+  pointer.x = (p.clientX / window.innerWidth) * 2 - 1;
+  pointer.y = -(p.clientY / window.innerHeight) * 2 + 1;
+}
+canvas.addEventListener('pointerdown', (e) => { setPointerFromEvent(e); onPointerDown(); });
+canvas.addEventListener('touchstart', (e) => { setPointerFromEvent(e); onPointerDown(); }, {passive:false});
+canvas.addEventListener('mousedown', (e) => { setPointerFromEvent(e); onPointerDown(); });
+
+function onPointerDown() {
+  raycaster.setFromCamera(pointer, camera);
+  const intersects = raycaster.intersectObjects(scene.children, true);
+  if (!intersects.length) return;
+  const hit = intersects[0].object;
+  if (hit.userData.slotIndex !== undefined) {
+    const idx = hit.userData.slotIndex;
+    if (idx === GameState.lobby.localSlot) {
+      const slot = GameState.lobby.slots[idx];
+      slot.color = new THREE.Color().setHSL(Math.random(), 0.6, 0.5).getHex();
+      pedestals[idx].userData.avatar.traverse(c => { if (c.isMesh) c.material.color.setHex(slot.color); });
+      updateSlotPanel(idx);
+      broadcastLobbyState();
+    }
+  }
+  if (hit === skinPanel) {
+    const slot = GameState.lobby.slots[GameState.lobby.localSlot];
+    slot.color = new THREE.Color().setHSL(Math.random(), 0.6, 0.5).getHex();
+    pedestals[0].userData.avatar.traverse(c => { if (c.isMesh) c.material.color.setHex(slot.color); });
+    updateSlotPanel(0);
+    broadcastLobbyState();
+  } else if (hit === invitePanel) {
+    // Create lobby (host) and generate 6-digit code + shareable URL
+    if (!GameState.lobby.lobbyId) {
+      createLocalLobbyAndShare();
+    } else {
+      showTempMessage('Lobby already created: ' + GameState.lobby.lobbyId);
+    }
+  } else if (hit === readyPanel) {
+    toggleReadyLocal();
+    broadcastLobbyState();
+  }
+}
+
+/* --- Clipboard helper --- */
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(()=>{});
+  } else {
+    const ta = document.getElementById('hiddenCopy');
+    ta.value = text; ta.select();
+    try { document.execCommand('copy'); } catch(e){}
+  }
+}
+
+/* --- Lobby UI updates --- */
+function updateSlotPanel(i) {
+  const slot = GameState.lobby.slots[i];
+  const panel = pedestals[i].userData.panel;
+  const tex = panel.userData._panelTexture;
+  const ctx = tex.image.getContext('2d');
+  ctx.fillStyle = '#111'; ctx.fillRect(0,0,tex.image.width, tex.image.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = '26px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(slot.name, tex.image.width/2, tex.image.height/2 - 18);
+  ctx.fillText(slot.ready ? 'READY' : 'NOT READY', tex.image.width/2, tex.image.height/2 + 18);
+  tex.needsUpdate = true;
+  pedestals[i].userData.avatar.traverse((c) => { if (c.isMesh) c.material.color.setHex(slot.color); });
+}
+
+function updateStartPanel() {
+  const allReady = GameState.lobby.slots.every(s => s && s.ready);
+  const tex = startPanel.userData._panelTexture;
+  const ctx = tex.image.getContext('2d');
+  ctx.fillStyle = '#222'; ctx.fillRect(0,0,tex.image.width, tex.image.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = '32px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(allReady ? 'All Ready — Starting...' : 'Waiting for players...', tex.image.width/2, tex.image.height/2);
+  tex.needsUpdate = true;
+}
+
+/* Toggle local ready */
+function toggleReadyLocal() {
+  const slot = GameState.lobby.slots[GameState.lobby.localSlot];
+  slot.ready = !slot.ready;
+  updateSlotPanel(GameState.lobby.localSlot);
+  updateStartPanel();
+  // bots randomize
+  for (let i = 1; i < 4; i++) {
+    if (Math.random() > 0.6) GameState.lobby.slots[i].ready = true;
+    updateSlotPanel(i);
+  }
+  updateStartPanel();
+  checkAllReadyAndStart();
+}
+
+/* Check all ready and start match */
+function checkAllReadyAndStart() {
+  const allReady = GameState.lobby.slots.every(s => s && s.ready);
+  if (allReady) {
+    setTimeout(() => startMatchFlow(), 900);
+  }
+}
+
+/* --- Match flow --- */
+function startMatchFlow() {
+  GameState.mode = 'loading';
+  GameState.match.players = {};
+  for (let i = 0; i < 4; i++) createMatchPlayer(GameState.lobby.slots[i]);
+  spawnChests(14);
+  showLoadingRing();
+  setTimeout(() => {
+    GameState.mode = 'bus';
+    hideLoadingRing();
+    camera.position.set(-40, 30, -40);
+    camera.lookAt(0, 0, 0);
+  }, 1600);
+}
+
+/* Loading ring */
+let loadingRing = null;
+function showLoadingRing() {
+  const geo = new THREE.RingGeometry(3.2, 3.6, 64);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  loadingRing = new THREE.Mesh(geo, mat);
+  loadingRing.rotation.x = -Math.PI/2;
+  loadingRing.position.set(0, 6, 0);
+  scene.add(loadingRing);
+}
+function hideLoadingRing() { if (loadingRing) scene.remove(loadingRing); loadingRing = null; }
+
+/* Bus */
+const bus = new THREE.Group();
+const busBody = new THREE.Mesh(new THREE.BoxGeometry(6, 2.2, 2.6), new THREE.MeshStandardMaterial({ color: 0xff3333 }));
+busBody.position.y = 0; bus.add(busBody);
+bus.position.copy(GameState.match.bus.pos);
+scene.add(bus);
+
+/* --- Physics & update loop --- */
+function update(delta) {
+  if (GameState.mode === 'lobby') {
+    lobbyGroup.rotation.y += delta * 0.12;
+    lobbyGroup.traverse((o) => {
+      if (o.userData && o.userData.slotIndex !== undefined && o.userData._panelTexture) o.lookAt(camera.position);
+    });
+  } else if (GameState.mode === 'bus') {
+    const b = GameState.match.bus;
+    const move = b.dir.clone().multiplyScalar(b.speed * delta);
+    b.pos.add(move);
+    bus.position.copy(b.pos);
+    bus.lookAt(b.pos.clone().add(b.dir));
+    for (const id in GameState.match.players) {
+      const p = GameState.match.players[id];
+      p.mesh.position.copy(bus.position).add(new THREE.Vector3(Math.random()*2-1, -1.2, Math.random()*2-1));
+    }
+    if (b.pos.x > 40 && GameState.mode !== 'drop') {
+      GameState.mode = 'drop';
+      for (const id in GameState.match.players) {
+        const p = GameState.match.players[id];
+        p.mesh.position.copy(bus.position).add(new THREE.Vector3((Math.random()-0.5)*6, -2.5, (Math.random()-0.5)*2));
+        p.velocity.set(0, -2 - Math.random()*2, 0);
+        p.hasGlider = false; p.onGround = false;
+      }
+      const local = GameState.match.players['p0'];
+      camera.position.copy(local.mesh.position).add(new THREE.Vector3(0, 6, 12));
+      camera.lookAt(local.mesh.position);
+    }
+  } else if (GameState.mode === 'drop' || GameState.mode === 'match') {
+    for (const id in GameState.match.players) {
+      const p = GameState.match.players[id];
+      if (!p.mesh.userData.alive) continue;
+      p.velocity.y -= 9.8 * delta * 0.6;
+      if (p.hasGlider) p.velocity.y = Math.max(p.velocity.y, -2.0);
+      p.mesh.position.addScaledVector(p.velocity, delta);
+      if (p.mesh.position.y <= 0.6) { p.mesh.position.y = 0.6; p.velocity.y = 0; p.onGround = true; }
+      if (p.isBot && p.onGround && Math.random() < 0.01) {
+        p.mesh.position.x += (Math.random()-0.5) * delta * 6;
+        p.mesh.position.z += (Math.random()-0.5) * delta * 6;
+        if (Math.random() < 0.02) {
+          const target = findNearestAliveExcept(p.id);
+          if (target) {
+            const dir = target.mesh.position.clone().sub(p.mesh.position).normalize();
+            spawnProjectile(p.mesh.position.clone().add(new THREE.Vector3(0,1.2,0)), dir, p.id);
+          }
+        }
+      }
+    }
+
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const pr = projectiles[i];
+      pr.position.addScaledVector(pr.userData.vel, delta);
+      if (pr.position.length() > 500) { scene.remove(pr); projectiles.splice(i,1); continue; }
+      for (const id in GameState.match.players) {
+        const p = GameState.match.players[id];
+        if (!p.mesh.userData.alive) continue;
+        if (p.mesh.position.distanceTo(pr.position) < 0.8 && pr.userData.owner !== id) {
+          p.mesh.userData.health -= 25;
+          scene.remove(pr); projectiles.splice(i,1);
+          if (p.mesh.userData.health <= 0) {
+            p.mesh.userData.alive = false; p.mesh.visible = false; checkVictoryCondition();
+          }
+          break;
+        }
+      }
+    }
+
+    for (const chest of GameState.match.chests) {
+      if (chest.userData.opened) continue;
+      for (const id in GameState.match.players) {
+        const p = GameState.match.players[id];
+        if (!p.mesh.userData.alive) continue;
+        if (p.mesh.position.distanceTo(chest.position) < 1.2) {
+          chest.userData.opened = true; chest.material.color.setHex(0x444444);
+          p.mesh.userData.health = Math.min(100, p.mesh.userData.health + 20);
+        }
+      }
+    }
+  }
+
+  if (loadingRing) loadingRing.rotation.z += delta * 2.0;
+  bus.rotation.z = Math.sin(clock.elapsedTime * 2) * 0.02;
+}
+
+/* find nearest alive except id */
+function findNearestAliveExcept(id) {
+  const me = GameState.match.players[id];
+  let best = null, bestD = Infinity;
+  for (const pid in GameState.match.players) {
+    if (pid === id) continue;
+    const p = GameState.match.players[pid];
+    if (!p.mesh.userData.alive) continue;
+    const d = p.mesh.position.distanceTo(me.mesh.position);
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best;
+}
+
+/* check victory */
+function checkVictoryCondition() {
+  const alive = Object.values(GameState.match.players).filter(p => p.mesh.userData.alive);
+  if (alive.length === 1) {
+    GameState.mode = 'victory';
+    showVictory(alive[0]);
+    setTimeout(() => {
+      cleanupMatch();
+      GameState.mode = 'lobby';
+      camera.position.set(0,6,12); camera.lookAt(0,0,0);
+    }, 6000);
+  }
+}
+
+/* show victory */
+function showVictory(winner) {
+  const panel = makePanelMesh([winner.name + ' Wins!', 'Victory Royale'], 4.0, 1.6, '#0a0', '#fff');
+  panel.position.set(0, 6, 0);
+  scene.add(panel);
+  setTimeout(() => scene.remove(panel), 5000);
+}
+
+/* cleanup match */
+function cleanupMatch() {
+  for (const id in GameState.match.players) scene.remove(GameState.match.players[id].mesh);
+  GameState.match.players = {};
+  for (const c of GameState.match.chests) scene.remove(c);
+  GameState.match.chests = [];
+  for (const pr of projectiles) scene.remove(pr);
+  projectiles.length = 0;
+  for (let i = 0; i < 4; i++) {
+    GameState.lobby.slots[i].ready = i === 0 ? false : Math.random() > 0.5;
+    updateSlotPanel(i);
+  }
+  updateStartPanel();
+}
+
+/* --- Simple 3D floating message --- */
+let tempMsg = null;
+function showTempMessage(msg, duration = 1400) {
+  if (tempMsg) scene.remove(tempMsg);
+  const p = makePanelMesh([msg], 2.4, 0.8, '#000', '#fff');
+  p.position.set(0, 4.5, 2);
+  scene.add(p);
+  tempMsg = p;
+  setTimeout(() => { scene.remove(p); tempMsg = null; }, duration);
+}
+
+/* --- Camera controls --- */
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enablePan = false;
+controls.enableZoom = false;
+controls.target.set(0, 1.5, 0);
+
+/* --- Animation loop --- */
+function animate() {
+  const dt = Math.min(0.05, clock.getDelta());
+  update(dt);
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+
+/* initial UI updates */
+for (let i = 0; i < 4; i++) updateSlotPanel(i);
+updateStartPanel();
+
+/* --- P2P WebRTC DataChannel (manual URL-based signaling) --- */
+/*
+  Approach:
+  - Host clicks Create Lobby -> generate 6-digit code and create an RTCPeerConnection + data channel.
+  - Host creates an SDP offer, encodes it (base64) and appends to URL fragment along with the code.
+  - Host shares the URL (only the fragment is used for signaling; fragment is not sent to server).
+  - Joiner opens the URL: script sees the encoded offer in fragment, creates RTCPeerConnection, sets remote description, creates answer, encodes answer into fragment and reloads the page (the host must then open the joiner's URL to complete handshake).
+  - To make it one-click for both sides, this demo uses the URL fragment exchange: host shares the generated URL; joiner opens it and the page will produce an answer URL which the joiner can copy and send back to the host. This is a serverless demo signaling method suitable for demos.
+  - For convenience, the demo also displays the 6-digit code in the 3D panel.
+*/
+const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+let pc = null;
+let dc = null;
+
+/* Utility: encode/decode base64 for URL-safe */
+function b64enc(str) { return btoa(unescape(encodeURIComponent(str))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function b64dec(b) { b = b.replace(/-/g,'+').replace(/_/g,'/'); while (b.length % 4) b += '='; return decodeURIComponent(escape(atob(b))); }
+
+/* Generate 6-digit code */
+function gen6() { return Math.floor(100000 + Math.random() * 900000).toString(); }
+
+/* Create lobby and produce shareable URL with encoded offer */
+async function createLocalLobbyAndShare() {
+  GameState.lobby.isHost = true;
+  GameState.lobby.lobbyId = gen6();
+  updateInvitePanelWithCode(GameState.lobby.lobbyId, 'Generating offer...');
+  // create peer connection and data channel
+  pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+  dc = pc.createDataChannel('lobby');
+  setupDataChannel(dc);
+  pc.oniceconnectionstatechange = () => console.log('ICE', pc.iceConnectionState);
+  // create offer
+  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
+  await pc.setLocalDescription(offer);
+  // wait for ICE gathering to complete (gather all candidates)
+  await waitForIceGatheringComplete(pc);
+  const sdp = pc.localDescription.sdp;
+  const encoded = b64enc(sdp);
+  // create shareable URL: include code and encoded offer in fragment
+  const frag = `lobby=${GameState.lobby.lobbyId}&offer=${encoded}`;
+  const url = location.origin + location.pathname + '#' + frag;
+  updateInvitePanelWithCode(GameState.lobby.lobbyId, url);
+  copyToClipboard(url);
+  showTempMessage('Lobby URL copied to clipboard');
+  // host now waits for answer: user will paste answer URL back via prompt (demo)
+  // Provide a small timeout to poll for answer via manual paste (host must paste joiner's URL)
+  setTimeout(() => {
+    promptForAnswerAndComplete();
+  }, 400);
+}
+
+/* Wait for ICE gathering complete */
+function waitForIceGatheringComplete(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    function check() {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    }
+    pc.addEventListener('icegatheringstatechange', check);
+    // safety timeout
+    setTimeout(resolve, 3000);
+  });
+}
+
+/* Prompt host to paste joiner's answer URL (manual step for demo) */
+async function promptForAnswerAndComplete() {
+  const answerUrl = prompt('Paste the joiner\'s URL (they will get it after opening your link). This completes the P2P handshake for the demo.\n\nIf you want fully automatic signaling, run a small signaling server instead.');
+  if (!answerUrl) { showTempMessage('Answer not provided'); return; }
+  try {
+    const frag = (new URL(answerUrl)).hash.substring(1);
+    const params = new URLSearchParams(frag);
+    const ansEnc = params.get('answer');
+    if (!ansEnc) { alert('No answer found in URL fragment'); return; }
+    const sdp = b64dec(ansEnc);
+    await pc.setRemoteDescription({ type: 'answer', sdp });
+    showTempMessage('P2P connected (host)');
+    // now host can send lobby state
+    broadcastLobbyState();
+  } catch (e) {
+    console.error(e); alert('Failed to parse answer URL');
+  }
+}
+
+/* When joiner opens a URL with offer in fragment, auto-create answer and produce answer URL for host */
+async function tryAutoAnswerFromFragment() {
+  const frag = location.hash.substring(1);
+  if (!frag) return;
+  const params = new URLSearchParams(frag);
+  const offerEnc = params.get('offer');
+  const code = params.get('lobby');
+  if (!offerEnc || !code) return;
+  // decode offer
+  const sdp = b64dec(offerEnc);
+  // create pc and set remote
+  pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+  pc.ondatachannel = (ev) => { dc = ev.channel; setupDataChannel(dc); };
+  await pc.setRemoteDescription({ type: 'offer', sdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceGatheringComplete(pc);
+  const ansEnc = b64enc(pc.localDescription.sdp);
+  // produce answer URL for host to paste back
+  const fragAns = `lobby=${code}&answer=${ansEnc}`;
+  const answerUrl = location.origin + location.pathname + '#' + fragAns;
+  // show answer URL in a 3D panel (invitePanel) so user can copy and send to host
+  updateInvitePanelWithCode(code, answerUrl, true);
+  copyToClipboard(answerUrl);
+  showTempMessage('Answer URL copied to clipboard. Send it to the host to complete connection.');
+}
+
+/* Setup data channel handlers */
+function setupDataChannel(channel) {
+  channel.onopen = () => {
+    console.log('DataChannel open');
+    showTempMessage('P2P DataChannel open');
+    // send initial lobby state if host
+    if (GameState.lobby.isHost) broadcastLobbyState();
+  };
+  channel.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      handlePeerMessage(msg);
+    } catch (e) { console.warn('Invalid peer message', e); }
+  };
+  channel.onclose = () => console.log('DataChannel closed');
+}
+
+/* Broadcast lobby state to peer */
+function broadcastLobbyState() {
+  if (!dc || dc.readyState !== 'open') return;
+  const payload = { type: 'lobbyState', slots: GameState.lobby.slots };
+  dc.send(JSON.stringify(payload));
+}
+
+/* Handle incoming peer messages */
+function handlePeerMessage(msg) {
+  if (msg.type === 'lobbyState') {
+    // merge remote slots into local (simple demo: replace)
+    for (let i = 0; i < 4; i++) {
+      if (msg.slots[i]) {
+        GameState.lobby.slots[i].name = msg.slots[i].name;
+        GameState.lobby.slots[i].color = msg.slots[i].color;
+        GameState.lobby.slots[i].ready = msg.slots[i].ready;
+        updateSlotPanel(i);
+      }
+    }
+    updateStartPanel();
+    checkAllReadyAndStart();
+  }
+}
+
+/* Update invite panel with code and URL (3D) */
+function updateInvitePanelWithCode(code, urlOrMsg, isAnswer=false) {
+  const lines = isAnswer ? ['Answer URL (send to host):', urlOrMsg] : ['Lobby ' + code, 'Share this URL:'];
+  const tex = invitePanel.userData._panelTexture;
+  const ctx = tex.image.getContext('2d');
+  ctx.fillStyle = '#08f'; ctx.fillRect(0,0,tex.image.width, tex.image.height);
+  ctx.fillStyle = '#012';
+  ctx.font = '20px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(lines[0], tex.image.width/2, tex.image.height/2 - 18);
+  // show shortened URL or message (trim)
+  const short = urlOrMsg.length > 48 ? urlOrMsg.slice(0,44) + '...' : urlOrMsg;
+  ctx.fillText(short, tex.image.width/2, tex.image.height/2 + 18);
+  tex.needsUpdate = true;
+}
+
+/* If page loaded with offer in fragment, auto-answer */
+tryAutoAnswerFromFragment();
+
+/* For host: after creating offer, prompt for answer (manual) is used above */
+
+/* --- Expose debug helpers --- */
+window.demo = { createLocalLobbyAndShare, broadcastLobbyState, startMatchFlow };
+
+/* --- End of module --- */
+</script>
+</body>
+</html>
